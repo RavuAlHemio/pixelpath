@@ -72,7 +72,7 @@ const LEFT_OFFSET: i32 = 100;
 const TOP_OFFSET: i32 = 100;
 const HORIZONTAL_FACTOR: i32 = 100;
 const VERTICAL_FACTOR: i32 = 100;
-const CROSSHAIR_LENGTH: i32 = 10;
+const CROSSHAIR_LENGTH: i32 = 20;
 const CROSSHAIR_THICKNESS: i32 = 4;
 const RENDER_NUMERATOR: i32 = 1;
 const RENDER_DENOMINATOR: i32 = 2;
@@ -122,10 +122,16 @@ unsafe extern "system" fn draw_window_proc(handle: HWND, message: u32, wparam: W
             let mut state_guard = STATE.lock().expect("failed to lock state");
             if key == VK_LEFT {
                 state_guard.cursor.x -= HORIZONTAL_FACTOR;
+                if state_guard.cursor.x < 0 {
+                    state_guard.cursor.x = 0;
+                }
             } else if key == VK_RIGHT {
                 state_guard.cursor.x += HORIZONTAL_FACTOR;
             } else if key == VK_UP {
                 state_guard.cursor.y -= VERTICAL_FACTOR;
+                if state_guard.cursor.y < 0 {
+                    state_guard.cursor.y = 0;
+                }
             } else if key == VK_DOWN {
                 state_guard.cursor.y += VERTICAL_FACTOR;
             } else if key == VK_SPACE {

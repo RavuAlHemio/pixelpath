@@ -1,7 +1,8 @@
 use windows::Win32::Foundation::COLORREF;
 use windows::Win32::Graphics::Gdi::{
-    BeginPath, CloseFigure, CreatePen, EndPath, FillPath, GetStockObject, GET_STOCK_OBJECT_FLAGS,
-    HDC, HGDIOBJ, HPEN, LineTo, MoveToEx, PEN_STYLE, SelectObject, StrokePath,
+    BeginPath, BS_SOLID, CloseFigure, CreateSolidBrush, EndPath, ExtCreatePen, FillPath, HBRUSH,
+    HDC, HGDIOBJ, HPEN, LineTo, LOGBRUSH, MoveToEx, PEN_STYLE, PS_ENDCAP_SQUARE, PS_GEOMETRIC,
+    PS_SOLID, SelectObject, StrokePath,
 };
 
 macro_rules! simple_gdi_func {
@@ -27,14 +28,6 @@ pub(crate) fn select_object<O: Into<HGDIOBJ>>(hdc: HDC, object: O, description: 
     }
 }
 
-pub(crate) fn select_stock_object(hdc: HDC, stock_object: GET_STOCK_OBJECT_FLAGS, description: &str) {
-    let stock_object = unsafe { GetStockObject(stock_object) };
-    if stock_object.is_invalid() {
-        panic!("failed to obtain {}", description);
-    }
-    select_object(hdc, stock_object, description);
-}
-
 pub(crate) fn move_to(hdc: HDC, x: i32, y: i32) {
     let moved = unsafe { MoveToEx(hdc, x, y, None) };
     if !moved.as_bool() {
@@ -57,10 +50,32 @@ pub(crate) const fn rgb(r: u8, g: u8, b: u8) -> COLORREF {
     COLORREF(color)
 }
 
-pub(crate) fn create_pen(style: PEN_STYLE, width: i32, color: COLORREF) -> HPEN {
-    let pen = unsafe { CreatePen(style, width, color) };
+pub(crate) fn ext_create_pen(style: PEN_STYLE, width: u32, brush: &LOGBRUSH, dashes: Option<&[u32]>) -> HPEN {
+    let pen = unsafe { ExtCreatePen(style, width, brush, dashes) };
     if pen.is_invalid() {
         panic!("failed to create pen");
     }
     pen
+}
+
+pub(crate) fn make_solid_square_endcap_pen(width: u32, color: COLORREF) -> HPEN {
+    let brush = LOGBRUSH {
+        lbColor: color,
+        lbStyle: BS_SOLID,
+        lbHatch: 0,
+    };
+    ext_create_pen(
+        PS_GEOMETRIC | PS_SOLID | PS_ENDCAP_SQUARE,
+        width,
+        &brush,
+        None,
+    )
+}
+
+pub(crate) fn make_solid_brush(color: COLORREF) -> HBRUSH {
+    let brush = unsafe { CreateSolidBrush(color) };
+    if brush.is_invalid() {
+        panic!("failed to create solid brush");
+    }
+    brush
 }

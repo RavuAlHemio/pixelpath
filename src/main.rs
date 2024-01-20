@@ -1,20 +1,24 @@
 mod gdi_primitives;
+mod xml;
 
 
-use std::fmt::Write as _;
+use std::ffi::OsString;
+use std::os::windows::ffi::OsStringExt;
 use std::sync::Mutex;
 
 use once_cell::sync::Lazy;
-use windows::core::w;
+use windows::core::{PWSTR, w};
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, BLACK_BRUSH, COLOR_WINDOW, EndPaint, FillRect, HBRUSH, HPEN, PAINTSTRUCT, PS_SOLID,
-    RDW_INVALIDATE, RDW_UPDATENOW, RedrawWindow,
+    BeginPaint, COLOR_WINDOW, EndPaint, FillRect, HBRUSH, HPEN, PAINTSTRUCT, RDW_INVALIDATE,
+    RDW_UPDATENOW, RedrawWindow,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{GetStartupInfoW, STARTUPINFOW};
+use windows::Win32::UI::Controls::Dialogs::{GetSaveFileNameW, OFN_OVERWRITEPROMPT, OPENFILENAMEW};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    VIRTUAL_KEY, VK_BACK, VK_DOWN, VK_ESCAPE, VK_LEFT, VK_P, VK_RETURN, VK_RIGHT, VK_SPACE, VK_UP,
+    GetKeyState, VIRTUAL_KEY, VK_BACK, VK_DOWN, VK_ESCAPE, VK_H, VK_LEFT, VK_P, VK_RETURN, VK_RIGHT,
+    VK_S, VK_SHIFT, VK_SPACE, VK_V, VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, CW_USEDEFAULT, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
@@ -23,9 +27,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::gdi_primitives::{
-    begin_path, close_figure, create_pen, end_path, fill_path, line_to, move_to, rgb, select_object,
-    select_stock_object, stroke_path,
+    begin_path, close_figure, end_path, fill_path, line_to, make_solid_brush,
+    make_solid_square_endcap_pen, move_to, rgb, select_object, stroke_path,
 };
+use crate::xml::assemble_svg;
 
 
 #[derive(Clone, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -33,32 +38,12 @@ struct ApplicationState {
     pub cursor: Point,
     pub is_drawing: bool,
     pub paths: Vec<ClosedPath>,
+    pub grid_count: Point,
 }
 
 #[derive(Clone, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 struct ClosedPath {
     pub points: Vec<Point>,
-}
-impl ClosedPath {
-    pub fn to_svg_elem(&self) -> String {
-        let mut path = self.to_svg_path();
-        path.insert_str(0, "<path d=\"");
-        path.push_str("\" />");
-        path
-    }
-
-    pub fn to_svg_path(&self) -> String {
-        if self.points.len() == 0 {
-            return String::with_capacity(0);
-        }
-        let mut ret = String::new();
-        for (i, point) in self.points.iter().enumerate() {
-            let prefix = if i == 0 { "M" } else { " L" };
-            write!(ret, "{} {} {}", prefix, point.x, point.y).unwrap();
-        }
-        ret.push_str(" z");
-        ret
-    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -73,41 +58,32 @@ const TOP_OFFSET: i32 = 100;
 const HORIZONTAL_FACTOR: i32 = 100;
 const VERTICAL_FACTOR: i32 = 100;
 const CROSSHAIR_LENGTH: i32 = 20;
-const CROSSHAIR_THICKNESS: i32 = 4;
+const CROSSHAIR_THICKNESS: u32 = 4;
 const RENDER_NUMERATOR: i32 = 1;
 const RENDER_DENOMINATOR: i32 = 2;
 const NOT_DRAWING_CROSSHAIR_COLOR: COLORREF = rgb(0x00, 0x00, 0xFF);
 const DRAWING_CROSSHAIR_COLOR: COLORREF = rgb(0xFF, 0x00, 0x00);
+const BLACK: COLORREF = rgb(0x00, 0x00, 0x00);
 
 static STATE: Lazy<Mutex<ApplicationState>> = Lazy::new(|| Mutex::new(ApplicationState::default()));
-static DRAWING_CROSSHAIR_PEN: Lazy<HPEN> = Lazy::new(|| create_pen(
-    PS_SOLID, CROSSHAIR_THICKNESS, DRAWING_CROSSHAIR_COLOR,
-));
-static NOT_DRAWING_CROSSHAIR_PEN: Lazy<HPEN> = Lazy::new(|| create_pen(
-    PS_SOLID, CROSSHAIR_THICKNESS, NOT_DRAWING_CROSSHAIR_COLOR,
-));
+static DRAWING_CROSSHAIR_PEN: Lazy<HPEN> = Lazy::new(|| make_solid_square_endcap_pen(CROSSHAIR_THICKNESS, DRAWING_CROSSHAIR_COLOR));
+static NOT_DRAWING_CROSSHAIR_PEN: Lazy<HPEN> = Lazy::new(|| make_solid_square_endcap_pen(CROSSHAIR_THICKNESS, NOT_DRAWING_CROSSHAIR_COLOR));
+static GRID_PEN: Lazy<HPEN> = Lazy::new(|| make_solid_square_endcap_pen(1, BLACK));
+static FONT_BRUSH: Lazy<HBRUSH> = Lazy::new(|| make_solid_brush(BLACK));
 
 
 fn default_window_proc(handle: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     unsafe { DefWindowProcW(handle, message, wparam, lparam) }
 }
 
-fn redraw_window_and_return_zero(handle: HWND) -> LRESULT {
-    unsafe { RedrawWindow(handle, None, None, RDW_INVALIDATE | RDW_UPDATENOW) };
-    LRESULT(0)
-}
-
 unsafe extern "system" fn draw_window_proc(handle: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if message == WM_CLOSE {
         unsafe { DestroyWindow(handle) }
             .expect("failed to destroy window");
-        return LRESULT(0);
     } else if message == WM_DESTROY {
         unsafe { PostQuitMessage(0) };
-        return LRESULT(0);
     } else if message == WM_PAINT {
         paint_draw_window(handle);
-        return LRESULT(0);
     } else if message == WM_KEYDOWN {
         let key: VIRTUAL_KEY = match wparam.0.try_into() {
             Ok(v) => VIRTUAL_KEY(v),
@@ -160,21 +136,49 @@ unsafe extern "system" fn draw_window_proc(handle: HWND, message: u32, wparam: W
                 state_guard.paths.pop();
                 state_guard.is_drawing = false;
             } else if key == VK_P {
-                for path in &state_guard.paths {
-                    println!("{}", path.to_svg_elem());
+                // print SVG document
+                let svg = assemble_svg(state_guard.grid_count, &state_guard.paths);
+                println!("{}", svg);
+            } else if key == VK_S {
+                // save SVG document
+                let svg = assemble_svg(state_guard.grid_count, &state_guard.paths);
+                save_svg(handle, &svg);
+            } else if key == VK_H {
+                // increase/decrease horizontal grid
+                let shift_state = unsafe { GetKeyState(VK_SHIFT.0.into()) };
+                if shift_state < 0 {
+                    // decrease
+                    state_guard.grid_count.x -= 1;
+                    if state_guard.grid_count.x < 0 {
+                        state_guard.grid_count.x = 0;
+                    }
+                } else {
+                    // increase
+                    state_guard.grid_count.x += 1;
                 }
+                redraw = true;
+            } else if key == VK_V {
+                // increase/decrease vertical grid
+                let shift_state = unsafe { GetKeyState(VK_SHIFT.0.into()) };
+                if shift_state < 0 {
+                    // decrease
+                    state_guard.grid_count.y -= 1;
+                    if state_guard.grid_count.y < 0 {
+                        state_guard.grid_count.y = 0;
+                    }
+                } else {
+                    // increase
+                    state_guard.grid_count.y += 1;
+                }
+                redraw = true;
             } else {
                 // unknown key -- don't redraw
                 redraw = false;
             }
-
-            println!("{:?}", state_guard.paths);
         }
 
         if redraw {
-            return redraw_window_and_return_zero(handle);
-        } else {
-            return LRESULT(0);
+            unsafe { RedrawWindow(handle, None, None, RDW_INVALIDATE | RDW_UPDATENOW) };
         }
     }
 
@@ -201,10 +205,53 @@ fn paint_draw_window(handle: HWND) {
     {
         let state_guard = STATE.lock().expect("failed to lock state");
 
-        // paint existing paths
-        select_stock_object(hdc, BLACK_BRUSH, "black brush");
+        // paint the grid
+        if state_guard.grid_count.x > 0 && state_guard.grid_count.y > 0 {
+            select_object(hdc, *GRID_PEN, "grid pen");
 
-        for path in &state_guard.paths {
+            // horizontals
+            let x_length = state_guard.grid_count.x * HORIZONTAL_FACTOR;
+            for y_index in 0..=state_guard.grid_count.y {
+                let y_pos = y_index * VERTICAL_FACTOR;
+                begin_path(hdc);
+                move_to(
+                    hdc,
+                    scale(LEFT_OFFSET),
+                    scale(TOP_OFFSET + y_pos),
+                );
+                line_to(
+                    hdc,
+                    scale(LEFT_OFFSET + x_length),
+                    scale(TOP_OFFSET + y_pos),
+                );
+                end_path(hdc);
+                stroke_path(hdc);
+            }
+
+            // verticals
+            let y_length = state_guard.grid_count.y * VERTICAL_FACTOR;
+            for x_index in 0..=state_guard.grid_count.x {
+                let x_pos = x_index * HORIZONTAL_FACTOR;
+                begin_path(hdc);
+                move_to(
+                    hdc,
+                    scale(LEFT_OFFSET + x_pos),
+                    scale(TOP_OFFSET),
+                );
+                line_to(
+                    hdc,
+                    scale(LEFT_OFFSET + x_pos),
+                    scale(TOP_OFFSET + y_length),
+                );
+                end_path(hdc);
+                stroke_path(hdc);
+            }
+        }
+
+        // paint existing paths
+        select_object(hdc, *FONT_BRUSH, "font brush");
+
+        for (path_index, path) in state_guard.paths.iter().enumerate() {
             if path.points.len() == 0 {
                 continue;
             }
@@ -223,7 +270,7 @@ fn paint_draw_window(handle: HWND) {
                 );
             }
 
-            if state_guard.is_drawing {
+            if state_guard.is_drawing && path_index == state_guard.paths.len() - 1 {
                 // also draw a line to the cursor
                 line_to(
                     hdc,
@@ -273,6 +320,32 @@ fn paint_draw_window(handle: HWND) {
     }
 
     unsafe { EndPaint(handle, &paint_struct) };
+}
+
+
+fn save_svg(parent: HWND, svg_string: &str) {
+    let mut path_buf = vec![0u16; 32768];
+
+    let mut open_file_name = OPENFILENAMEW::default();
+    open_file_name.lStructSize = std::mem::size_of_val(&open_file_name).try_into().unwrap();
+    open_file_name.hwndOwner = parent;
+    open_file_name.lpstrFilter = w!("Scalable Vector Graphics (*.svg)\0*.svg\0All Files (*.*)\0*.*\0\0");
+    open_file_name.lpstrDefExt = w!("svg");
+    open_file_name.lpstrFile = PWSTR(path_buf.as_mut_ptr());
+    open_file_name.nMaxFile = path_buf.len().try_into().unwrap();
+    open_file_name.Flags = OFN_OVERWRITEPROMPT;
+    let result = unsafe { GetSaveFileNameW(&mut open_file_name) };
+    if !result.as_bool() {
+        return;
+    }
+
+    let nul_index = path_buf.iter()
+        .position(|c| *c == 0x0000)
+        .unwrap_or(path_buf.len());
+    let path_osstring = OsString::from_wide(&path_buf[0..nul_index]);
+    if let Err(e) = std::fs::write(&path_osstring, svg_string) {
+        println!("error writing SVG: {}", e);
+    }
 }
 
 
